@@ -1,8 +1,10 @@
-import argparse #for parsing the command-line arguments
-import re #for parsing the command-line arguments
-import socket #for TCP communication with the FANUC server
-import time #for the datetime and sleep functions
-import serial #serial is used for serial communication with the mock gauge 
+import argparse  # command-line arguments
+import re  # record parsing regex
+import socket  # TCP link to the FANUC controller
+import time  # perf_counter_ns for latency, sleep for backoff
+
+import serial  # RS232 link to the gauge (pyserial)
+
 # ----------------------------------------------------------------------------
 # Configuration & Tolerances
 # ----------------------------------------------------------------------------
@@ -11,6 +13,7 @@ USL = 0.015          # +0.015 mm -> above this is REWORK
 LSL = -0.015         # -0.015 mm -> below this is REJECT (scrap)
 REWORK_MAX = 0.030   # above this is REJECT
 PROBE_TOL = 0.010    # max allowed |ch1 - ch2| before the part is sent to REWORK
+OFFSET_DEADBAND = 0.005  # mm, mean deviations below this are treated as noise
 MACRO_VAR = 500      # CNC macro variable for tool offset (#500)
 PMC_ADDR = "R0500"   # PMC register for sorting bits
 
@@ -21,15 +24,17 @@ SOCK_TIMEOUT = 2.0                      # seconds, connect + every read
 MAX_RETRIES = 5                         # attempts per cycle before it is dropped
 BACKOFF_START, BACKOFF_MAX = 0.2, 3.0   # reconnect backoff, seconds
 
-OFFSET_DEADBAND = 0.005  # mm, ignore noise below this when computing tool-wear offset
+RECORD_REGEX = re.compile(
+    r"(\d{3})\s+(\S+)\s+([+-]\d+\.\d+)\s+([+-]\d+\.\d+)\s+(OK|REWORK|REJECT)"
+)
 
-RECORD_REGEX = re.compile( r"(\d{3})\s+(\S+)\s+([+-]\d+\.\d+)\s+([+-]\d+\.\d+)\s+(OK|REWORK|REJECT)")
 
 # ----------------------------------------------------------------------------
 # Serial side: framing + parsing
 # ----------------------------------------------------------------------------
 class LineFramer:
     """Safely handles partial reads and split lines from the serial buffer."""
+
     def __init__(self, max_line=128):
         self.buf = bytearray()
         self.max_line = max_line
@@ -48,6 +53,7 @@ class LineFramer:
             if chunk:
                 lines.append(chunk)
         return lines
+
 
 def parse_record(raw):
     """Strictly parse one ASCII record; raise ValueError if malformed."""
@@ -76,13 +82,14 @@ def probe_verdict(ch):
         return "REWORK"
     return "OK"
 
+
 def classify_part(ch1, ch2):
     """Worst probe wins; probes that disagree too much -> REWORK."""
     verdict = max(probe_verdict(ch1), probe_verdict(ch2), key=SEVERITY.get)
-    if verdict != "REJECT":
-    mean_dev = (rec["ch1"] + rec["ch2"]) / 2 - NOMINAL
-    if abs(mean_dev) >= OFFSET_DEADBAND:
-        commands.append(f"cnc_wrmacro(#{MACRO_VAR}, {mean_dev:+.4f})")
+    if verdict == "OK" and abs(ch1 - ch2) > PROBE_TOL + 1e-9:
+        verdict = "REWORK"
+    return verdict
+
 
 # ----------------------------------------------------------------------------
 # Ethernet side: FANUC client with handshake, timeouts, reconnect
@@ -152,6 +159,7 @@ def deliver(client, commands):
                 backoff = min(backoff * 2, BACKOFF_MAX)
     return None
 
+
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
@@ -164,6 +172,7 @@ def main():
     args = parser.parse_args()
 
     print("[Gateway] Starting Simplified Edge-LoC Gateway Service...")
+
     try:
         ser = serial.Serial(args.serial, args.baud, timeout=0.1)
     except serial.SerialException as e:
@@ -190,10 +199,12 @@ def main():
                 verdict = classify_part(rec["ch1"], rec["ch2"])
                 commands = [f"pmc_wrrange({PMC_ADDR}, {SORT_BIT[verdict]})"]
 
-                # Tool-wear offset only for a genuine oversize part
-                max_dev = max(rec["ch1"], rec["ch2"]) - NOMINAL
-                if verdict == "REWORK" and max_dev > USL:
-                    commands.append(f"cnc_wrmacro(#{MACRO_VAR}, {max_dev:+.4f})")
+                # Tool-wear offset: mean deviation, outside the noise deadband,
+                # and never from a scrapped part
+                if verdict != "REJECT":
+                    mean_dev = (rec["ch1"] + rec["ch2"]) / 2 - NOMINAL
+                    if abs(mean_dev) >= OFFSET_DEADBAND:
+                        commands.append(f"cnc_wrmacro(#{MACRO_VAR}, {mean_dev:+.4f})")
 
                 latency = deliver(client, commands)
 
