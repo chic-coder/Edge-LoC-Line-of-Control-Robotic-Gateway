@@ -1,104 +1,218 @@
+import argparse #for parsing the command-line arguments
+import re #for parsing the command-line arguments
+import socket #for TCP communication with the FANUC server
+import time #for the datetime and sleep functions
+import serial #serial is used for serial communication with the mock gauge 
+# ----------------------------------------------------------------------------
+# Configuration & Tolerances
+# ----------------------------------------------------------------------------
+NOMINAL = 10.000
+USL = 0.015          # +0.015 mm -> above this is REWORK
+LSL = -0.015         # -0.015 mm -> below this is REJECT (scrap)
+REWORK_MAX = 0.030   # above this is REJECT
+PROBE_TOL = 0.010    # max allowed |ch1 - ch2| before the part is sent to REWORK
+MACRO_VAR = 500      # CNC macro variable for tool offset (#500)
+PMC_ADDR = "R0500"   # PMC register for sorting bits
 
-import time
-import socket
-import serial
-import re
+SORT_BIT = {"OK": "0x01", "REWORK": "0x02", "REJECT": "0x04"}
+SEVERITY = {"OK": 0, "REWORK": 1, "REJECT": 2}
 
-# Configuration
-SERIAL_PORT = "/dev/pts/0"  # The paired terminal to the mock gauge
-BAUD_RATE = 115200
-FANUC_HOST = "127.0.0.1"
-FANUC_PORT = 8193
+SOCK_TIMEOUT = 2.0                      # seconds, connect + every read
+MAX_RETRIES = 5                         # attempts per cycle before it is dropped
+BACKOFF_START, BACKOFF_MAX = 0.2, 3.0   # reconnect backoff, seconds
 
-NOMINAL_SIZE = 10.000
-USL = 0.015  # Upper specification limit deviation (+0.015 mm)
-LSL = -0.015 # Lower specification limit deviation (-0.015 mm)
+RECORD_REGEX = re.compile( r"(\d{3})\s+(\S+)\s+([+-]\d+\.\d+)\s+([+-]\d+\.\d+)\s+(OK|REWORK|REJECT)")
 
-def send_to_fanuc(sock, payload):
-    """Sends command over TCP and awaits ACK, ensuring sub-50ms turnaround."""
-    start_time = time.time()
+# ----------------------------------------------------------------------------
+# Serial side: framing + parsing
+# ----------------------------------------------------------------------------
+class LineFramer:
+    """Safely handles partial reads and split lines from the serial buffer."""
+    def __init__(self, max_line=128):
+        self.buf = bytearray()
+        self.max_line = max_line
+
+    def feed(self, data):
+        self.buf += data
+        lines = []
+        while True:
+            i = self.buf.find(b"\n")
+            if i == -1:
+                if len(self.buf) > self.max_line:
+                    self.buf.clear()  # drop overflow junk
+                break
+            chunk = bytes(self.buf[:i]).rstrip(b"\r")
+            del self.buf[:i + 1]
+            if chunk:
+                lines.append(chunk)
+        return lines
+
+def parse_record(raw):
+    """Strictly parse one ASCII record; raise ValueError if malformed."""
     try:
-        sock.sendall((payload + "\r\n").encode("utf-8"))
-        response = sock.recv(1024).decode("utf-8")
-        latency = (time.time() - start_time) * 1000
-        print(f"   [Ethernet TX -> FANUC] {payload} | Response: {response.strip()} | Latency: {latency:.2f}ms")
-    except Exception as e:
-        print(f"   [Ethernet Error] Socket transmission failed: {e}")
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise ValueError("non-ASCII bytes")
 
-def run_gateway():
-    print("[Gateway] Initializing Edge-LoC Gateway Service...")
+    m = RECORD_REGEX.fullmatch(text)
+    if not m:
+        raise ValueError("bad format or field count")
 
-    # Establish TCP connection to Mock FANUC Controller
-    fanuc_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    device, part, c1, c2, gauge = m.groups()
+    return {"device": device, "part": part,
+            "ch1": float(c1), "ch2": float(c2), "gauge": gauge}
+
+
+# ----------------------------------------------------------------------------
+# Decision logic
+# ----------------------------------------------------------------------------
+def probe_verdict(ch):
+    dev = ch - NOMINAL
+    if dev < LSL or dev > REWORK_MAX:
+        return "REJECT"
+    if dev > USL:
+        return "REWORK"
+    return "OK"
+
+def classify_part(ch1, ch2):
+    """Worst probe wins; probes that disagree too much -> REWORK."""
+    verdict = max(probe_verdict(ch1), probe_verdict(ch2), key=SEVERITY.get)
+    if verdict == "OK" and abs(ch1 - ch2) > PROBE_TOL + 1e-9:
+        verdict = "REWORK"
+    return verdict
+
+# ----------------------------------------------------------------------------
+# Ethernet side: FANUC client with handshake, timeouts, reconnect
+# ----------------------------------------------------------------------------
+class FanucClient:
+    def __init__(self, host, port):
+        self.host, self.port = host, port
+        self.sock = None
+        self.rfile = None
+
+    def connect(self):
+        self.close()
+        sock = socket.create_connection((self.host, self.port), timeout=SOCK_TIMEOUT)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(SOCK_TIMEOUT)
+            rfile = sock.makefile("rb")
+            banner = rfile.readline(64).strip()
+            if banner != b"READY":
+                raise ConnectionError(f"expected READY, got {banner!r}")
+        except OSError:
+            sock.close()
+            raise
+        self.sock, self.rfile = sock, rfile
+        print(f"[Ethernet] Connected to FANUC at {self.host}:{self.port} (READY)")
+
+    def close(self):
+        for res in (self.rfile, self.sock):
+            if res:
+                try:
+                    res.close()
+                except OSError:
+                    pass
+        self.sock = self.rfile = None
+
+    def send(self, commands):
+        """Send all commands in one payload, wait for one ACK line per command.
+        Returns round-trip latency in ms."""
+        t0 = time.perf_counter_ns()
+        payload = "".join(cmd + "\r\n" for cmd in commands)
+        self.sock.sendall(payload.encode("ascii"))
+        for cmd in commands:
+            reply = self.rfile.readline(64)
+            if not reply:
+                raise ConnectionError("connection closed by controller")
+            reply = reply.decode("ascii", "replace").strip()
+            if not reply.startswith("ACK"):
+                raise ConnectionError(f"{cmd} rejected: {reply}")
+        return (time.perf_counter_ns() - t0) / 1e6
+
+
+def deliver(client, commands):
+    """Send one cycle's commands, reconnecting and resending on any failure.
+    Safe to resend: both commands write absolute values (idempotent).
+    Returns latency in ms, or None if the cycle had to be dropped."""
+    backoff = BACKOFF_START
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if client.sock is None:
+                client.connect()
+            return client.send(commands)
+        except OSError as e:  # includes timeouts and ConnectionError
+            print(f"[Ethernet Error] attempt {attempt}/{MAX_RETRIES}: {e}")
+            client.close()
+            if attempt < MAX_RETRIES:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, BACKOFF_MAX)
+    return None
+
+# ----------------------------------------------------------------------------
+# Main loop
+# ----------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Simplified Edge-LoC Gateway")
+    parser.add_argument("--serial", default="/dev/pts/1", help="Serial port path")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--host", default="127.0.0.1", help="FANUC server IP")
+    parser.add_argument("--tcp-port", type=int, default=8193, help="FANUC server TCP port")
+    args = parser.parse_args()
+
+    print("[Gateway] Starting Simplified Edge-LoC Gateway Service...")
     try:
-        fanuc_socket.connect((FANUC_HOST, FANUC_PORT))
-        print(f"[Gateway] Connected to FANUC Controller at {FANUC_HOST}:{FANUC_PORT}")
-    except Exception as e:
-        print(f"[Gateway Error] Could not connect to FANUC server: {e}")
-        return
-
-    # Open Serial Port
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        print(f"[Gateway] Listening for gauge records on {SERIAL_PORT}...")
-    except Exception as e:
+        ser = serial.Serial(args.serial, args.baud, timeout=0.1)
+    except serial.SerialException as e:
         print(f"[Gateway Error] Failed to open serial port: {e}")
-        fanuc_socket.close()
         return
+    print(f"[Gateway] Listening for gauge telemetry on {args.serial}...")
 
-    buffer = ""
-    while True:
-        data = ser.read(ser.in_waiting or 1).decode("ascii", errors="ignore")
-        if data:
-            buffer += data
-            # Process complete lines based on carriage returns
-            if "\n" in buffer:
-                lines = buffer.split("\n")
-                buffer = lines[-1]  # Keep remainder in buffer
-                for line in lines[:-1]:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    print(f"\n[Incoming Telemetry] {line}")
-                    
-                    # Regex Pattern to parse fields: ID, Serial, Ch1, Ch2, Verdict
-                    match = re.match(r"(\d{3})\s+(\S+)\s+([+-]\d+\.\d+)\s+([+-]\d+\.\d+)\s+(\w+)", line)
-                    if match:
-                        dev_id, part_serial, ch1_str, ch2_str, gauge_verdict = match.groups()
-                        ch1 = float(ch1_str)
-                        ch2 = float(ch2_str)
-                        
-                        # Edge Decision Logic
-                        max_deviation = max(ch1, ch2) - NOMINAL_SIZE
-                        
-                        if LSL <= max_deviation <= USL:
-                            verdict = "OK"
-                            sorting_bit = "0x01"  # OK conveyor drop
-                            offset_cmd = None
-                        elif max_deviation > USL and max_deviation <= 0.030:
-                            verdict = "REWORK"
-                            sorting_bit = "0x02"  # Rework station[cite: 1]
-                            # Calculate dynamic tool wear correction for macro #500
-                            offset_value = round(max_deviation, 4)
-                            offset_cmd = f"cnc_wrmacro(#500, +{offset_value:.4f})"
-                        else:
-                            verdict = "REJECT"
-                            sorting_bit = "0x04"  # Scrap chute[cite: 1]
-                            offset_cmd = None
+    client = FanucClient(args.host, args.tcp_port)
+    framer = LineFramer()
 
-                        # 1. Execute Tool Offset Correction if needed (CNC Action)
-                        if offset_cmd:
-                            send_to_fanuc(fanuc_socket, offset_cmd)
+    try:
+        while True:
+            data = ser.read(ser.in_waiting or 1)
+            if not data:
+                continue
 
-                        # 2. Execute Sorting Actuation via PMC register update
-                        pmc_cmd = f"pmc_wrrange(R0500, {sorting_bit})"
-                        send_to_fanuc(fanuc_socket, pmc_cmd)
-                        
-                        print(f"   [Decision Outcome] Verdict: {verdict} | Sorting Bit Sent: {sorting_bit}")
-                    else:
-                        print("   [Parsing Warning] Malformed line skipped.")
-        time.sleep(0.01)
+            for raw_line in framer.feed(data):
+                try:
+                    rec = parse_record(raw_line)
+                except ValueError as e:
+                    print(f"[Parsing Warning] Skipped malformed line: {e}")
+                    continue
+
+                verdict = classify_part(rec["ch1"], rec["ch2"])
+                commands = [f"pmc_wrrange({PMC_ADDR}, {SORT_BIT[verdict]})"]
+
+                # Tool-wear offset only for a genuine oversize part
+                max_dev = max(rec["ch1"], rec["ch2"]) - NOMINAL
+                if verdict == "REWORK" and max_dev > USL:
+                    commands.append(f"cnc_wrmacro(#{MACRO_VAR}, {max_dev:+.4f})")
+
+                latency = deliver(client, commands)
+
+                print(f"\n[Telemetry] Dev {rec['device']} | Part {rec['part']} | "
+                      f"Ch1 {rec['ch1']:+.4f} | Ch2 {rec['ch2']:+.4f}")
+                if verdict != rec["gauge"]:
+                    print(f"   [Mismatch] gauge said {rec['gauge']}, gateway computed {verdict}")
+                if latency is None:
+                    print(f"   [Dropped] {verdict}: controller unreachable after "
+                          f"{MAX_RETRIES} attempts")
+                else:
+                    print(f"   [Decision] {verdict} | TX {' ; '.join(commands)} | "
+                          f"ACK | {latency:.2f} ms")
+
+    except KeyboardInterrupt:
+        print("\n[Gateway] Shutting down...")
+    except serial.SerialException as e:
+        print(f"[Gateway Error] Serial link lost: {e}")
+    finally:
+        ser.close()
+        client.close()
+
 
 if __name__ == "__main__":
-    run_gateway()
+    main()
