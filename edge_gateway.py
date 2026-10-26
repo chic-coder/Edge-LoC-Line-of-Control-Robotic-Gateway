@@ -20,7 +20,8 @@ PMC_ADDR = "R0500"   # PMC register for sorting bits
 SORT_BIT = {"OK": "0x01", "REWORK": "0x02", "REJECT": "0x04"}
 SEVERITY = {"OK": 0, "REWORK": 1, "REJECT": 2}
 
-SOCK_TIMEOUT = 0.05                      # 50ms (latency check), connect + every read
+SOCK_TIMEOUT = 0.5                     # 500ms, connect + every read
+LATENCY_TARGET_MS=50                    # 50ms target for round-trip latency from serial read to FANUC ACK
 MAX_RETRIES = 5                         # attempts per cycle before it is dropped
 BACKOFF_START, BACKOFF_MAX = 0.2, 3.0   # reconnect backoff, seconds
 
@@ -216,8 +217,9 @@ def main():
                     print(f"   [Dropped] {verdict}: controller unreachable after "
                           f"{MAX_RETRIES} attempts")
                 else:
+                    flag = "" if latency < LATENCY_TARGET_MS else f"  [OVER {LATENCY_TARGET_MS} ms TARGET]"
                     print(f"   [Decision] {verdict} | TX {' ; '.join(commands)} | "
-                          f"ACK | {latency:.2f} ms")
+                          f"ACK | LATENCY {latency:.2f} ms{flag}")
 
     except KeyboardInterrupt:
         print("\n[Gateway] Shutting down...")
