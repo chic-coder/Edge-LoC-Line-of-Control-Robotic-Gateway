@@ -20,7 +20,7 @@ drift, faults)                          classify, actuate)              fault in
 | `run_gateway.py` | Main application system entry point runtime dashboard logic. |
 | `run_mock_fanuc.py` | Executable launcher entry point initialization interface for the mock server node. |
 | `run_mock_gauge.py` | Executable launcher entry point initialization interface for the mock serial pipeline transmitter. |
-| `tests/` | Automated unit verification suites checking framing buffers, boundary checks, and consensus fallback matrix states. |
+| `test_gateway.py` | Automated unit verification suites checking framing buffers, boundary checks, and consensus fallback matrix states. |
 
 ---
 
@@ -119,7 +119,7 @@ Expected: `[FANUC Mock] Mock FANUC listening on 127.0.0.1:8193`
 ### Step 3: Start the gateway (Terminal 3)
 
 ```bash
-python3 run_gateway.py --serial /tmp/ttyGATEWAY --host 127.0.0.1 --tcp-port 8193
+python3 run_gateway.py
 ```
 
 Expected:
@@ -129,12 +129,55 @@ Expected:
 ### Step 4: Start the mock gauge (Terminal 4)
 
 ```bash
-python3 run_mock_gauge.py --port /tmp/ttyGAUGE --mode drift --interval 1.0
+python3 run_mock_gauge.py
 ```
 
 ---
+---
 
-## 6. Execution Verification Logs
+## 6. Fault Injection & Edge Resilience Testing
+
+The simulation tools include built-in parameters to replicate hostile factory environments (network latency, disconnected sockets, dropped packets, and electrical noise over serial lines). Use these flags to verify the gateway's self-healing capabilities.
+
+### Scenario A: Network Dropped Sockets & Reconnections
+Simulate an unstable Ethernet connection where the controller randomly drops the gateway offline before dispatching an acknowledgment.
+* **Launch Command (Terminal 2):**
+  ```bash
+  python3 run_mock_fanuc.py --drop-every 3
+  ```
+* **Expected Gateway Behavior:** Every 3rd transaction cycle, the connection drops. The gateway logs `[Ethernet Error] Transport issue...`, instantly tears down the dead socket, runs an exponential backoff sleep interval, reconnects automatically, and retries transmission without crashing or losing data.
+
+### Scenario B: Controller Processing Latency Violations
+Simulate a sluggish or heavily loaded controller to test performance boundary warnings.
+* **Launch Command (Terminal 2):**
+  ```bash
+  python3 run_mock_fanuc.py --ack-delay-ms 20
+  ```
+* **Expected Gateway Behavior:** The mock server pauses for 20ms before responding. If any case exceeds the system baseline performance ceiling (`LATENCY_TARGET_MS = 50`), the gateway logs append a clear warning flag to the performance readout:
+  ```text
+  [Routing Action] -> OK | Latency: 61.45ms [LATENCY FAULT]
+  ```
+
+### Scenario C: Command Rejections (NAK Injections)
+Simulate a scenario where the CNC controller refuses an incoming packet because its processing sub-buffers are busy.
+* **Launch Command (Terminal 2):**
+  ```bash
+  python3 run_mock_fanuc.py --nak-rate 0.30
+  ```
+* **Expected Gateway Behavior:** The mock server randomly rejects 30% of incoming payloads with a `NAK BUSY` error. The gateway catches the failure, safely triggers its transport recovery engine, and executes retries up to 5 times until the cycle clears successfully.
+
+### Scenario D: Serial Framing Errors & Cable Distortion
+Simulate electrical interference or a loose serial connection causing broken ASCII fragments, dropped fields, or unexpected status inputs.
+* **Launch Command (Terminal 4):**
+  ```bash
+  python3 run_mock_gauge.py --fault-rate 0.15
+  ```
+* **Expected Gateway Behavior:** The gauge deliberately distorts 15% of the data stream. The gateway's low-level `LineFramer` slices through the corrupted bytes, and the parser purges the invalid records cleanly without crashing the main daemon thread loop:
+  ```text
+  [Framer Warning] Discarding corrupted structure slice: bad format or field count mismatch
+  ```
+
+## 7. Execution Verification Logs
 
 ### Gateway Console Interface
 [Ethernet] Link established with FANUC server at 127.0.0.1:8193
@@ -150,3 +193,4 @@ To confirm the integrity of modular parameters, framing checks, and boundary log
 ```bash
 python -m unittest discover -s tests
 ```
+
