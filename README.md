@@ -5,7 +5,7 @@ A Python edge gateway that bridges a precision RS232 gauge and a FANUC CNC contr
 Since no physical machinery is available, the repo includes its own **mock gauge** (virtual serial transmitter) and **mock FANUC controller** (TCP server) so the whole chain runs on one laptop, under WSL or Linux.
 
 Use code with caution.
-mock_gauge.py ──RS232 (socat PTY pair)──▶ run_gateway.py ──TCP :8193──▶ run_mock_fanuc.py
+run_mock_gauge.py ──RS232 (socat PTY pair)──▶ run_gateway.py ──TCP :8193──▶ run_mock_fanuc.py
 (random parts,                          (frame, parse,                  (READY / ACK / NAK,
 drift, faults)                          classify, actuate)              fault injection)
 
@@ -193,6 +193,6 @@ Simulate electrical interference or a loose serial connection causing broken ASC
 ### Running Automated Test Verification Suites
 To confirm the integrity of modular parameters, framing checks, and boundary logic configurations at any point, execute:
 ```bash
-python -m unittest discover -s tests
+python3 -m unittest discover -s tests
 ```
 
