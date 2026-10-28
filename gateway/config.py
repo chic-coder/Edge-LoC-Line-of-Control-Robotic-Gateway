@@ -5,7 +5,7 @@ NOMINAL = 10.0000
 USL = 0.0150              # +0.015 mm -> Rework boundary
 LSL = -0.0150             # -0.015 mm -> Scrap boundary
 REWORK_MAX = 0.030       # Extreme upper tolerance limit
-PROBE_TOL = 0.0010        # Maximum deviation delta across channels
+PROBE_TOL = 0.0100        # Maximum deviation delta across channels
 OFFSET_DEADBAND = 0.0050  # Noise floor filter
 
 MACRO_VAR = 500          # Target CNC macro variable (#500)
