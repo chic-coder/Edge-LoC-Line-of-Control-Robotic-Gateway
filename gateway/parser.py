@@ -2,9 +2,7 @@
 """Handles translation of raw wire-bytes into validated data objects."""
 import re
 
-RECORD_REGEX = re.compile(
-    r"(\d{3})\s+(\S+)\s+([+-]\d+\.\d+)\s+([+-]\d+\.\d+)\s+(OK|REWORK|REJECT)"
-)
+RECORD_REGEX = re.compile( r"(\d{3}) (\d{10}_\d{5}) ([+-]\d{3}\.\d{4}) ([+-]\d{3}\.\d{4}) (OK|REWORK|REJECT)\Z")
 
 def parse_record(raw: bytes) -> dict:
     """Decodes string fields and extracts float values. Raises ValueError on corruption."""
@@ -12,8 +10,8 @@ def parse_record(raw: bytes) -> dict:
         text = raw.decode("ascii")
     except UnicodeDecodeError:
         raise ValueError("non-ASCII bytes detected")
-
-    m = RECORD_REGEX.fullmatch(text)
+    
+    m = RECORD_REGEX.search(text)
     if not m:
         raise ValueError("bad format or field count mismatch")
 
