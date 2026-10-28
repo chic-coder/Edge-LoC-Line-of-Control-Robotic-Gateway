@@ -58,14 +58,14 @@ pmc_wrrange(R0500, 0x01)       write sorting bits: 0x01 OK, 0x02 REWORK, 0x04 RE
 | `USL` | +0.015 mm | Above this, the probe reading is **REWORK** |
 | `LSL` | -0.015 mm | Below this, **REJECT** (cannot add material back) |
 | `REWORK_MAX` | +0.030 mm | Above this, **REJECT** (too much to recover) |
-| `PROBE_TOL` | 0.0010 mm | Max allowed `\|ch1 - ch2\|` deviation before flagging **REWORK** |
+| `PROBE_TOL` | 0.0100 mm | Max allowed `\|ch1 - ch2\|` deviation before flagging **REWORK** |
 | `OFFSET_DEADBAND` | 0.005 mm | Mean deviations below this are treated as noise |
 
 ## Verdict
 
 1. Each probe is classified on its own (deviation = reading minus nominal).
 2. The **worse probe reading sets the decision** (`REJECT > REWORK > OK`).
-3. If the result is **OK** but the probes disagree by more than `PROBE_TOL` (`0.0010 mm`), the part becomes **REWORK**, because the measurement itself is suspect.
+3. If the result is **OK** but the probes disagree by more than `PROBE_TOL` (`0.0100 mm`), the part becomes **REWORK**, because the measurement itself is not reliable.
 4. The gateway **recomputes** the verdict and does not trust the gauge's own. A disagreement is logged as `[Mismatch]`.
 
 ## Actions
