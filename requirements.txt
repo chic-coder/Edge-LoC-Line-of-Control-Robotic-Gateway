@@ -1,0 +1,7 @@
+# Python packages (install with: pip install -r requirements.txt)
+pyserial>=3.5
+
+# Not installable with pip, listed for completeness (see README, Step 0):
+#   Linux (WSL2 Ubuntu or Raspberry Pi OS)
+#   Python 3.8 or newer
+#   socat (sudo apt install socat) - virtual serial cable for the demo only
