@@ -1,11 +1,8 @@
 # run_gateway.py
 import argparse
 import serial
-from gateway.config import NOMINAL, OFFSET_DEADBAND, PMC_ADDR, MACRO_VAR, SORT_BIT, LATENCY_TARGET_MS
-from gateway.line_framer import LineFramer
-from gateway.parser import parse_record
-from gateway.decision import classify_part
-from gateway.fanuc_client import FanucClient, deliver
+from gateway.core import Gateway
+from gateway.fanuc_client import FanucClient
 
 def main():
     parser = argparse.ArgumentParser(description="Edge-LoC System Runtime Gateway Engine")
@@ -22,41 +19,21 @@ def main():
         print(f"[Gateway Core Fault] Serial connection initialization failed: {e}")
         return
 
-    client = FanucClient(args.host, args.tcp_port)
-    framer = LineFramer()
+    gateway = Gateway(FanucClient(args.host, args.tcp_port))
 
     try:
         while True:
             data = ser.read(ser.in_waiting or 1)
-            if not data:
-                continue
-            for raw_line in framer.feed(data):
-                try:
-                    rec = parse_record(raw_line)
-                except ValueError as e:
-                    print(f"[Framer Warning] Discarding corrupted structure slice: {e}")
-                    continue
-
-                verdict = classify_part(rec["ch1"], rec["ch2"])
-                commands = [f"pmc_wrrange({PMC_ADDR}, {SORT_BIT[verdict]})"]
-
-                if verdict != "REJECT":
-                    mean_dev = (rec["ch1"] + rec["ch2"]) / 2 - NOMINAL
-                    if abs(mean_dev) >= OFFSET_DEADBAND:
-                        commands.append(f"cnc_wrmacro(#{MACRO_VAR}, {mean_dev:+.4f})")
-
-                latency = deliver(client, commands)
-                print(f"\n[Telemetry Log] Dev {rec['device']} | Part {rec['part']} | Ch1 {rec['ch1']:+.4f} | Ch2 {rec['ch2']:+.4f}")
-                if latency is None:
-                    print(f"   [DROPPED PACKET] Unreachable infrastructure node.")
-                else:
-                    flag = " [LATENCY FAULT]" if latency >= LATENCY_TARGET_MS else ""
-                    print(f"   [Routing Action] -> {verdict} | Latency: {latency:.2f}ms{flag}")
+            if data:
+                gateway.feed(data)
     except KeyboardInterrupt:
         print("\n[Gateway Engine] Interrupted. Powering down processing layers cleanly.")
+    except serial.SerialException as e:
+        print(f"\n[Gateway Core Fault] Serial link lost: {e}")
     finally:
         ser.close()
-        client.close()
+        gateway.client.close()
+        print("\n" + gateway.summary())
 
 if __name__ == "__main__":
     main()
